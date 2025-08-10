@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import subprocess
+import signal
+import logging
+from pathlib import Path
+
+# Configuration
+PID_FILE = Path("/tmp/auto_next_soundcloud.pid")
+LOG_FILE = Path("/tmp/auto_next_soundcloud.log")
+SKIP_INTERVAL = 120  # 2 minutes in seconds
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def send_next_command():
+    """Send next track command using AppleScript with error handling."""
+    # Use the correct NEXT button selector found by the inspector
+    next_button_selector = ".skipControl.sc-ir.playControls__control.playControls__next.sc-button.sc-button-secondary.sc-button-large.sc-button-icon.sc-mr-3x.skipControl__next"
+    
+    # Script that finds SoundCloud tab and clicks next WITHOUT bringing Chrome to front
+    applescript_click = f'''
+    tell application "Google Chrome"
+        -- Don't activate Chrome, work in background
+        repeat with w from 1 to count of windows
+            repeat with t from 1 to count of tabs of window w
+                tell tab t of window w
+                    if URL contains "soundcloud.com" then
+                        -- Found SoundCloud tab, click next button
+                        execute javascript "
+                            var btn = document.querySelector('{next_button_selector}');
+                            if (btn && btn.offsetParent !== null && !btn.disabled) {{
+                                btn.click();
+                                'SUCCESS';
+                            }} else {{
+                                'NOT_FOUND';
+                            }}
+                        "
+                        return result
+                    end if
+                end tell
+            end repeat
+        end repeat
+        return "NO_SOUNDCLOUD_TAB"
+    end tell
+    '''
+    
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", applescript_click], 
+            capture_output=True, 
+            text=True, 
+            timeout=15
+        )
+        
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            if "SUCCESS" in output:
+                logger.info("Next track clicked successfully in background")
+                return True
+            elif "NO_SOUNDCLOUD_TAB" in output:
+                logger.error("No SoundCloud tab found in Chrome")
+                return False
+            else:
+                logger.error("Next button not found on SoundCloud tab")
+                return False
+        else:
+            logger.error(f"AppleScript error: {result.stderr}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error clicking next button: {e}")
+        return False
+    
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", applescript_click], 
+            capture_output=True, 
+            text=True, 
+            timeout=15
+        )
+        
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            if "SUCCESS:" in output:
+                logger.info(f"Next track command sent successfully: {output}")
+                return True
+            else:
+                logger.error(f"Could not click next button: {output}")
+                return False
+        else:
+            logger.error(f"AppleScript error: {result.stderr}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        logger.error("AppleScript command timed out")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to send next command: {e}")
+        return False
+
+def cleanup_pid_file():
+    """Clean up PID file if process is not running."""
+    if PID_FILE.exists():
+        try:
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            
+            # Check if process is actually running
+            os.kill(pid, 0)  # This will raise ProcessLookupError if process doesn't exist
+            
+        except (ProcessLookupError, ValueError, OSError):
+            logger.info("Cleaning up stale PID file")
+            PID_FILE.unlink()
+            return True
+    return False
+
+def setup_signal_handlers():
+    """Setup signal handlers for graceful shutdown."""
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, shutting down gracefully")
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+def daemon_loop():
+    """Main daemon loop with error recovery."""
+    setup_signal_handlers()
+    consecutive_failures = 0
+    max_failures = 5
+    
+    logger.info("Starting auto-skip daemon")
+    
+    while True:
+        try:
+            success = send_next_command()
+            
+            if success:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.error(f"Too many consecutive failures ({max_failures}), stopping daemon")
+                    break
+            
+            time.sleep(SKIP_INTERVAL)
+            
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt")
+            break
+        except Exception as e:
+            logger.error(f"Unexpected error in daemon loop: {e}")
+            consecutive_failures += 1
+            if consecutive_failures >= max_failures:
+                break
+            time.sleep(10)  # Short delay before retrying
+    
+    # Cleanup
+    if PID_FILE.exists():
+        PID_FILE.unlink()
+    logger.info("Daemon stopped")
+
+def start():
+    """Start the auto-skip daemon."""
+    # Clean up stale PID files
+    cleanup_pid_file()
+    
+    if PID_FILE.exists():
+        print("Script is already running.")
+        return 1
+    
+    # Test AppleScript before forking
+    logger.info("Testing next button click...")
+    if not send_next_command():
+        print("Failed to click next button. Please check:")
+        print("1. SoundCloud is open in Chrome")
+        print("2. Music is currently playing")
+        print("3. Chrome is the active application")
+        return 1
+    
+    print("✅ Next button click test successful!")
+    
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # Parent process - store child PID
+            with open(PID_FILE, "w") as f:
+                f.write(str(pid))
+            print(f"Started auto-skip daemon with PID {pid}")
+            print(f"Songs will be skipped every {SKIP_INTERVAL} seconds (2 minutes)")
+            print(f"Logs will be written to: {LOG_FILE}")
+            return 0
+        else:
+            # Child process - run daemon loop
+            # Redirect stdout/stderr for proper daemonization
+            with open('/dev/null', 'w') as devnull:
+                os.dup2(devnull.fileno(), sys.stdout.fileno())
+                os.dup2(devnull.fileno(), sys.stderr.fileno())
+            
+            daemon_loop()
+            return 0
+            
+    except OSError as e:
+        logger.error(f"Failed to fork process: {e}")
+        return 1
+
+def stop():
+    """Stop the auto-skip daemon."""
+    if not PID_FILE.exists():
+        print("Script is not running.")
+        return 1
+    
+    try:
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        
+        # Try graceful shutdown first
+        os.kill(pid, signal.SIGTERM)
+        
+        # Wait a bit for graceful shutdown
+        time.sleep(2)
+        
+        # Check if process is still running
+        try:
+            os.kill(pid, 0)
+            # Still running, force kill
+            logger.warning("Process didn't respond to SIGTERM, using SIGKILL")
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            # Process already stopped
+            pass
+        
+        print(f"Stopped auto-skip daemon (PID {pid})")
+        return 0
+        
+    except (ProcessLookupError, ValueError) as e:
+        print(f"Error stopping process: {e}")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error while stopping: {e}")
+        return 1
+    finally:
+        # Always try to clean up PID file
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+
+def status():
+    """Check the status of the auto-skip daemon."""
+    if not PID_FILE.exists():
+        print("Auto-skip daemon is not running.")
+        return 1
+    
+    try:
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        
+        # Check if process is actually running
+        os.kill(pid, 0)
+        print(f"Auto-skip daemon is running with PID {pid}")
+        print(f"Log file: {LOG_FILE}")
+        return 0
+        
+    except (ProcessLookupError, ValueError):
+        print("Auto-skip daemon is not running (stale PID file found).")
+        cleanup_pid_file()
+        return 1
+
+def test():
+    """Test clicking the next button once."""
+    print("Testing next button click...")
+    if send_next_command():
+        print("✅ SUCCESS! Next button clicked successfully.")
+        return 0
+    else:
+        print("❌ FAILED! Could not click next button.")
+        print("Make sure:")
+        print("1. SoundCloud is open in Chrome")
+        print("2. Music is currently playing")
+        print("3. Chrome is the active application")
+        return 1
+
+def main():
+    """Main entry point."""
+    if len(sys.argv) != 2:
+        print("Usage: python soundcloud_next.py [start|stop|status|test]")
+        print("  start  - Start the auto-skip daemon")
+        print("  stop   - Stop the auto-skip daemon")
+        print("  status - Check daemon status")
+        print("  test   - Test clicking next button once")
+        return 1
+    
+    command = sys.argv[1].lower()
+    
+    if command == "start":
+        return start()
+    elif command == "stop":
+        return stop()
+    elif command == "status":
+        return status()
+    elif command == "test":
+        return test()
+    else:
+        print("Invalid argument. Use 'start', 'stop', 'status', or 'test'.")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
