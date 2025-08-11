@@ -25,33 +25,96 @@ logger = logging.getLogger(__name__)
 
 def send_next_command():
     """Send next track command using AppleScript with error handling."""
+    # First check if Chrome is running
+    applescript_check_chrome = '''
+    tell application "System Events"
+        return (name of processes) contains "Google Chrome"
+    end tell
+    '''
+    
+    try:
+        chrome_check = subprocess.run(
+            ["osascript", "-e", applescript_check_chrome], 
+            capture_output=True, 
+            text=True, 
+            timeout=5
+        )
+        
+        if chrome_check.returncode != 0 or "false" in chrome_check.stdout.lower():
+            logger.warning("Chrome is not running - skipping this attempt")
+            return "CHROME_NOT_RUNNING"
+            
+    except Exception as e:
+        logger.warning(f"Could not check if Chrome is running: {e}")
+        return "CHROME_CHECK_FAILED"
+    
     # Use the correct NEXT button selector found by the inspector
     next_button_selector = ".skipControl.sc-ir.playControls__control.playControls__next.sc-button.sc-button-secondary.sc-button-large.sc-button-icon.sc-mr-3x.skipControl__next"
     
-    # Script that finds SoundCloud tab and clicks next WITHOUT bringing Chrome to front
+    # Modified script that ONLY works when SoundCloud is actively playing
     applescript_click = f'''
     tell application "Google Chrome"
         -- Don't activate Chrome, work in background
+        set playingTabs to {{}}
+        
+        -- Find SoundCloud tabs that are currently playing
         repeat with w from 1 to count of windows
             repeat with t from 1 to count of tabs of window w
                 tell tab t of window w
                     if URL contains "soundcloud.com" then
-                        -- Found SoundCloud tab, click next button
-                        execute javascript "
-                            var btn = document.querySelector('{next_button_selector}');
-                            if (btn && btn.offsetParent !== null && !btn.disabled) {{
-                                btn.click();
-                                'SUCCESS';
-                            }} else {{
-                                'NOT_FOUND';
-                            }}
-                        "
-                        return result
+                        -- Found SoundCloud tab, check if it's actively playing
+                        try
+                            set playState to execute javascript "
+                                // Check multiple ways to detect if music is playing
+                                var playBtn = document.querySelector('.playControl, .playControls__play');
+                                var pauseBtn = document.querySelector('.playControl__pause, .playControls__pause');
+                                
+                                // Method 1: Look for playing class
+                                if (playBtn && playBtn.classList.contains('playing')) {{
+                                    'PLAYING';
+                                }} else if (playBtn && playBtn.classList.contains('paused')) {{
+                                    'PAUSED';
+                                }} else {{
+                                    // Method 2: Check if pause button is visible (means playing)
+                                    var playControlDiv = document.querySelector('.playControl');
+                                    if (playControlDiv && playControlDiv.classList.contains('playing')) {{
+                                        'PLAYING';
+                                    }} else {{
+                                        'PAUSED';
+                                    }}
+                                }}
+                            "
+                            
+                            if playState contains "PLAYING" then
+                                set end of playingTabs to {{window:w, tab:t}}
+                            end if
+                        end try
                     end if
                 end tell
             end repeat
         end repeat
-        return "NO_SOUNDCLOUD_TAB"
+        
+        -- Only proceed if we found actively playing SoundCloud tabs
+        if (count of playingTabs) = 0 then
+            return "NO_PLAYING_SOUNDCLOUD"
+        end if
+        
+        -- Use the first playing SoundCloud tab
+        set targetTab to item 1 of playingTabs
+        
+        -- Click next on the playing tab
+        tell tab (tab of targetTab) of window (window of targetTab)
+            execute javascript "
+                var btn = document.querySelector('{next_button_selector}');
+                if (btn && btn.offsetParent !== null && !btn.disabled) {{
+                    btn.click();
+                    'SUCCESS';
+                }} else {{
+                    'NOT_FOUND';
+                }}
+            "
+            return result
+        end tell
     end tell
     '''
     
@@ -60,20 +123,23 @@ def send_next_command():
             ["osascript", "-e", applescript_click], 
             capture_output=True, 
             text=True, 
-            timeout=15
+            timeout=20
         )
         
         if result.returncode == 0:
             output = result.stdout.strip()
             if "SUCCESS" in output:
-                logger.info("Next track clicked successfully in background")
+                logger.info("Next track clicked on PLAYING SoundCloud tab")
                 return True
+            elif "NO_PLAYING_SOUNDCLOUD" in output:
+                logger.info("SoundCloud found but no music currently playing - skipping")
+                return "NO_PLAYING_SOUNDCLOUD"
             elif "NO_SOUNDCLOUD_TAB" in output:
-                logger.error("No SoundCloud tab found in Chrome")
-                return False
+                logger.warning("No SoundCloud tab found in Chrome")
+                return "NO_SOUNDCLOUD_TAB"
             else:
-                logger.error("Next button not found on SoundCloud tab")
-                return False
+                logger.warning("Next button not found on playing SoundCloud tab")
+                return "BUTTON_NOT_FOUND"
         else:
             logger.error(f"AppleScript error: {result.stderr}")
             return False
@@ -139,21 +205,52 @@ def setup_signal_handlers():
 def daemon_loop():
     """Main daemon loop with error recovery."""
     setup_signal_handlers()
-    consecutive_failures = 0
-    max_failures = 5
+    consecutive_real_failures = 0
+    consecutive_button_failures = 0
+    max_real_failures = 5
+    max_button_failures = 3  # Only try 3 times if button not found
     
     logger.info("Starting auto-skip daemon")
     
     while True:
         try:
-            success = send_next_command()
+            result = send_next_command()
             
-            if success:
-                consecutive_failures = 0
+            if result is True:
+                # Successful click - reset all counters
+                consecutive_real_failures = 0
+                consecutive_button_failures = 0
+                logger.info("Song skipped successfully")
+                
+            elif result == "BUTTON_NOT_FOUND":
+                # Button not found - likely interface changed
+                consecutive_button_failures += 1
+                logger.warning(f"Button not found. Attempt {consecutive_button_failures}/{max_button_failures}")
+                
+                if consecutive_button_failures >= max_button_failures:
+                    logger.error("Button not found after 3 attempts. SoundCloud interface may have changed.")
+                    logger.error("Please run: python3 inspect_soundcloud.py to find new button selector")
+                    logger.error("Stopping daemon - manual fix required")
+                    break
+                    
+            elif result in ["CHROME_NOT_RUNNING", "NO_SOUNDCLOUD_TAB", "CHROME_CHECK_FAILED"]:
+                # Environmental issues - keep trying indefinitely
+                logger.info(f"Skipping attempt: {result} - will keep trying")
+                # Reset button failure counter since this isn't a button issue
+                consecutive_button_failures = 0
+                
+            elif result == "NO_PLAYING_SOUNDCLOUD":
+                # SoundCloud exists but not playing - don't count as failure
+                logger.info("SoundCloud paused - waiting for music to start playing")
+                # Reset button failure counter since this isn't a button issue
+                consecutive_button_failures = 0
+                
             else:
-                consecutive_failures += 1
-                if consecutive_failures >= max_failures:
-                    logger.error(f"Too many consecutive failures ({max_failures}), stopping daemon")
+                # Real script/system failure
+                consecutive_real_failures += 1
+                logger.error(f"Real failure occurred. Count: {consecutive_real_failures}")
+                if consecutive_real_failures >= max_real_failures:
+                    logger.error(f"Too many consecutive real failures ({max_real_failures}), stopping daemon")
                     break
             
             time.sleep(SKIP_INTERVAL)
@@ -163,8 +260,8 @@ def daemon_loop():
             break
         except Exception as e:
             logger.error(f"Unexpected error in daemon loop: {e}")
-            consecutive_failures += 1
-            if consecutive_failures >= max_failures:
+            consecutive_real_failures += 1
+            if consecutive_real_failures >= max_real_failures:
                 break
             time.sleep(10)  # Short delay before retrying
     
